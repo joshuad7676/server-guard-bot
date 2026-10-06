@@ -37,8 +37,8 @@ const WHITELIST_IDS = String(process.env.WHITELIST_IDS || '')
   .filter(Boolean);
 const OWNER_ID = (process.env.OWNER_ID || '').trim();
 
-if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
-  console.error('Missing DISCORD_TOKEN / CLIENT_ID / GUILD_ID in .env');
+if (!TOKEN || !CLIENT_ID) {
+  console.error('Missing DISCORD_TOKEN / CLIENT_ID in .env');
   process.exit(1);
 }
 
@@ -61,6 +61,8 @@ const pendingNuke = new Map();         // userId -> { type, category }
 const pendingReset = new Map();        // userId -> { name }
 const joinTimes = [];                  // timestamps (ms) of recent joins
 const msgTimes = new Map();            // userId -> [timestamps]
+const popularCooldowns = new Map();     // `${userId}:${guildId}` -> timestamp
+const popularMessages = new Map();      // buttonId -> { text, guildId, channelId }
 let isLocked = false;
 let savedOverwrites = new Map();       // channelId -> { send: true|false|null, connect: true|false|null } | null
 let savedVerification = null;
@@ -167,10 +169,6 @@ async function requireMyGuild(interaction) {
     await interaction.reply({ content: '❌ This bot only works inside a server, not in DMs.', flags: MessageFlags.Ephemeral });
     return false;
   }
-  if (interaction.guildId !== GUILD_ID) {
-    await interaction.reply({ content: '❌ Refused: this bot only works in the server set as GUILD_ID.', flags: MessageFlags.Ephemeral });
-    return false;
-  }
   return true;
 }
 
@@ -265,6 +263,10 @@ const commands = [
     .setDescription('Unlock admin commands with the password')
     .addStringOption(o => o.setName('password').setDescription('Bot password').setRequired(true)),
   new SlashCommandBuilder()
+    .setName('popular')
+    .setDescription('Type a message, then click the button to send it 5 times')
+    .addStringOption(o => o.setName('message').setDescription('Message to send').setRequired(true)),
+  new SlashCommandBuilder()
     .setName('lockdown')
     .setDescription('Lock the server (deny Send Messages / Connect for @everyone)')
     .addStringOption(o => o.setName('reason').setDescription('Why?').setRequired(false))
@@ -343,8 +345,12 @@ const commands = [
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  console.log('Slash commands registered to guild', GUILD_ID);
+  const route = GUILD_ID
+    ? Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID)
+    : Routes.applicationCommands(CLIENT_ID);
+
+  await rest.put(route, { body: commands });
+  console.log(GUILD_ID ? `Slash commands registered to guild ${GUILD_ID}` : 'Slash commands registered globally');
 }
 
 // ---------- EVENTS ----------
@@ -411,7 +417,7 @@ client.on('messageCreate', async (msg) => {
 
 // B) mass-join detection
 client.on('guildMemberAdd', async (member) => {
-  if (member.guild.id !== GUILD_ID) return;
+  if (GUILD_ID && member.guild.id !== GUILD_ID) return;
   const now = Date.now();
   joinTimes.push(now);
   while (joinTimes.length && now - joinTimes[0] > 30_000) joinTimes.shift();
@@ -448,6 +454,33 @@ client.on('interactionCreate', async (interaction) => {
         .setRequired(true);
       modal.addComponents(new ActionRowBuilder().addComponents(input));
       return interaction.showModal(modal);
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('popular:')) {
+      const btnId = interaction.customId.replace(/^popular:/, '');
+      const payload = popularMessages.get(btnId);
+      if (!payload) {
+        return interaction.reply({ content: '❌ That button expired. Run /popular again.', flags: MessageFlags.Ephemeral });
+      }
+      if (interaction.guildId !== payload.guildId || interaction.channelId !== payload.channelId) {
+        return interaction.reply({ content: '❌ This button is only valid in the original channel.', flags: MessageFlags.Ephemeral });
+      }
+      const key = `${interaction.user.id}:${interaction.guild.id}`;
+      const now = Date.now();
+      const last = popularCooldowns.get(key) || 0;
+      if (now - last < 1500) {
+        const remaining = ((1500 - (now - last)) / 1000).toFixed(1);
+        return interaction.reply({ content: `⏳ Please wait ${remaining}s before using /popular again.`, flags: MessageFlags.Ephemeral });
+      }
+      popularCooldowns.set(key, now);
+      const channel = interaction.channel;
+      if (!channel || !channel.isTextBased()) {
+        return interaction.reply({ content: '❌ I can only send in a text channel.', flags: MessageFlags.Ephemeral });
+      }
+      for (let i = 0; i < 5; i++) {
+        await channel.send(payload.text).catch(() => {});
+      }
+      return interaction.reply({ content: `✅ Sent "${payload.text}" 5 times.`, flags: MessageFlags.Ephemeral });
     }
 
     // --- Modal submits ---
@@ -511,6 +544,33 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: '✅ Unlocked!', flags: MessageFlags.Ephemeral });
       }
       return interaction.reply({ content: '❌ Wrong password.', flags: MessageFlags.Ephemeral });
+    }
+
+    if (interaction.commandName === 'popular') {
+      const text = interaction.options.getString('message', true).trim();
+      if (!text) {
+        return interaction.reply({ content: '❌ Please enter a message.', flags: MessageFlags.Ephemeral });
+      }
+      const buttonId = `popular:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+      popularMessages.set(buttonId, {
+        text,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+      });
+      setTimeout(() => popularMessages.delete(buttonId), 10 * 60 * 1000);
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(buttonId)
+          .setLabel('Send 5x')
+          .setStyle(ButtonStyle.Primary)
+      );
+
+      return interaction.reply({
+        content: `Click below to send this 5 times:\n> ${text}`,
+        components: [row],
+        flags: MessageFlags.Ephemeral,
+      });
     }
 
     // everything else: must be my guild + unlocked
