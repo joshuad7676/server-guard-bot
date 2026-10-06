@@ -345,12 +345,8 @@ const commands = [
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  const route = GUILD_ID
-    ? Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID)
-    : Routes.applicationCommands(CLIENT_ID);
-
-  await rest.put(route, { body: commands });
-  console.log(GUILD_ID ? `Slash commands registered to guild ${GUILD_ID}` : 'Slash commands registered globally');
+  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+  console.log('Slash commands registered globally');
 }
 
 // ---------- EVENTS ----------
@@ -417,7 +413,6 @@ client.on('messageCreate', async (msg) => {
 
 // B) mass-join detection
 client.on('guildMemberAdd', async (member) => {
-  if (GUILD_ID && member.guild.id !== GUILD_ID) return;
   const now = Date.now();
   joinTimes.push(now);
   while (joinTimes.length && now - joinTimes[0] > 30_000) joinTimes.shift();
